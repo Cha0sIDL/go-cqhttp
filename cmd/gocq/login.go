@@ -3,18 +3,26 @@ package gocq
 import (
 	"bufio"
 	"bytes"
+	"encoding/hex"
+	"fmt"
 	"image"
 	"image/png"
+	"net/http"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/Mrs4s/MiraiGo/client"
+	"github.com/Mrs4s/MiraiGo/utils"
+	"github.com/Mrs4s/go-cqhttp/internal/base"
 	"github.com/mattn/go-colorable"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
+	"gopkg.ilharper.com/x/isatty"
 
 	"github.com/Mrs4s/go-cqhttp/global"
+	"github.com/Mrs4s/go-cqhttp/internal/download"
 )
 
 var console = bufio.NewReader(os.Stdin)
@@ -25,7 +33,7 @@ func readLine() (str string) {
 	return
 }
 
-func readLineTimeout(t time.Duration, de string) (str string) {
+func readLineTimeout(t time.Duration) {
 	r := make(chan string)
 	go func() {
 		select {
@@ -33,15 +41,22 @@ func readLineTimeout(t time.Duration, de string) (str string) {
 		case <-time.After(t):
 		}
 	}()
-	str = de
 	select {
-	case str = <-r:
+	case <-r:
 	case <-time.After(t):
 	}
-	return
+}
+
+func readIfTTY(de string) (str string) {
+	if isatty.Isatty(os.Stdin.Fd()) {
+		return readLine()
+	}
+	log.Warnf("未检测到输入终端，自动选择%s.", de)
+	return de
 }
 
 var cli *client.QQClient
+var device *client.DeviceInfo
 
 // ErrSMSRequestError SMS请求出错
 var ErrSMSRequestError = errors.New("sms request error")
@@ -142,11 +157,15 @@ func loginResponseProcessor(res *client.LoginResponse) error {
 		var text string
 		switch res.Error {
 		case client.SliderNeededError:
-			log.Warnf("登录需要滑条验证码, 请使用手机QQ扫描二维码以继续登录.")
-			cli.Disconnect()
-			cli.Release()
-			cli = client.NewClientEmpty()
-			return qrcodeLogin()
+			log.Warnf("登录需要滑条验证码, 请验证后重试.")
+			ticket := getTicket(res.VerifyUrl)
+			if ticket == "" {
+				log.Infof("按 Enter 继续....")
+				readLine()
+				os.Exit(0)
+			}
+			res, err = cli.SubmitTicket(ticket)
+			continue
 		case client.NeedCaptcha:
 			log.Warnf("登录需要验证码.")
 			_ = os.WriteFile("captcha.jpg", res.CaptchaImage, 0o644)
@@ -170,8 +189,8 @@ func loginResponseProcessor(res *client.LoginResponse) error {
 			log.Warnf("账号已开启设备锁，请选择验证方式:")
 			log.Warnf("1. 向手机 %v 发送短信验证码", res.SMSPhone)
 			log.Warnf("2. 使用手机QQ扫码验证.")
-			log.Warn("请输入(1 - 2) (将在10秒后自动选择2)：")
-			text = readLineTimeout(time.Second*10, "2")
+			log.Warn("请输入(1 - 2)：")
+			text = readIfTTY("2")
 			if strings.Contains(text, "1") {
 				if !cli.RequestSMS() {
 					log.Warnf("发送验证码失败，可能是请求过于频繁.")
@@ -186,20 +205,108 @@ func loginResponseProcessor(res *client.LoginResponse) error {
 		case client.UnsafeDeviceError:
 			log.Warnf("账号已开启设备锁，请前往 -> %v <- 验证后重启Bot.", res.VerifyUrl)
 			log.Infof("按 Enter 或等待 5s 后继续....")
-			readLineTimeout(time.Second*5, "")
+			readLineTimeout(time.Second * 5)
 			os.Exit(0)
 		case client.OtherLoginError, client.UnknownLoginError, client.TooManySMSRequestError:
 			msg := res.ErrorMessage
-			if strings.Contains(msg, "版本") {
-				msg = "密码错误或账号被冻结"
+			log.Warnf("登录失败: %v Code: %v", msg, res.Code)
+			switch res.Code {
+			case 235:
+				log.Warnf("设备信息被封禁, 请删除 device.json 后重试.")
+			case 237:
+				log.Warnf("登录过于频繁, 请在手机QQ登录并根据提示完成认证后等一段时间重试")
+			case 45:
+				log.Warnf("你的账号被限制登录, 请配置 SignServer 后重试")
 			}
-			if strings.Contains(msg, "冻结") {
-				log.Fatalf("账号被冻结")
-			}
-			log.Warnf("登录失败: %v", msg)
-			log.Infof("按 Enter 或等待 5s 后继续....")
-			readLineTimeout(time.Second*5, "")
+			log.Infof("按 Enter 继续....")
+			readLine()
 			os.Exit(0)
 		}
 	}
+}
+
+func getTicket(u string) string {
+	log.Warnf("请选择提交滑块ticket方式:")
+	log.Warnf("1. 自动提交")
+	log.Warnf("2. 手动抓取提交")
+	log.Warn("请输入(1 - 2)：")
+	text := readLine()
+	id := utils.RandomString(8)
+	auto := !strings.Contains(text, "2")
+	if auto {
+		u = strings.ReplaceAll(u, "https://ssl.captcha.qq.com/template/wireless_mqq_captcha.html?", fmt.Sprintf("https://captcha.go-cqhttp.org/captcha?id=%v&", id))
+	}
+	log.Warnf("请前往该地址验证 -> %v ", u)
+	if !auto {
+		log.Warn("请输入ticket： (Enter 提交)")
+		return readLine()
+	}
+
+	for count := 120; count > 0; count-- {
+		str := fetchCaptcha(id)
+		if str != "" {
+			return str
+		}
+		time.Sleep(time.Second)
+	}
+	log.Warnf("验证超时")
+	return ""
+}
+
+func fetchCaptcha(id string) string {
+	g, err := download.Request{URL: "https://captcha.go-cqhttp.org/captcha/ticket?id=" + id}.JSON()
+	if err != nil {
+		log.Debugf("获取 Ticket 时出现错误: %v", err)
+		return ""
+	}
+	if g.Get("ticket").Exists() {
+		return g.Get("ticket").String()
+	}
+	return ""
+}
+
+func energy(uin uint64, id string, appVersion string, salt []byte) ([]byte, error) {
+	signServer := base.SignServer
+	if !strings.HasSuffix(signServer, "/") {
+		signServer += "/"
+	}
+	response, err := download.Request{
+		Method: http.MethodGet,
+		URL:    signServer + "custom_energy" + fmt.Sprintf("?data=%v&salt=%v", id, hex.EncodeToString(salt)),
+	}.Bytes()
+	if err != nil {
+		log.Warnf("获取T544 sign时出现错误: %v server: %v", err, signServer)
+		return nil, err
+	}
+	data, err := hex.DecodeString(gjson.GetBytes(response, "data").String())
+	if err != nil {
+		log.Warnf("获取T544 sign时出现错误: %v", err)
+		return nil, err
+	}
+	if len(data) == 0 {
+		log.Warnf("获取T544 sign时出现错误: %v", "data is empty")
+		return nil, errors.New("data is empty")
+	}
+	return data, nil
+}
+
+func sign(seq uint64, uin string, cmd string, qua string, buff []byte) (sign []byte, extra []byte, token []byte, err error) {
+	signServer := base.SignServer
+	if !strings.HasSuffix(signServer, "/") {
+		signServer += "/"
+	}
+	response, err := download.Request{
+		Method: http.MethodPost,
+		URL:    signServer + "sign",
+		Header: map[string]string{"Content-Type": "application/x-www-form-urlencoded"},
+		Body:   bytes.NewReader([]byte(fmt.Sprintf("uin=%v&qua=%s&cmd=%s&seq=%v&buffer=%v", uin, qua, cmd, seq, hex.EncodeToString(buff)))),
+	}.Bytes()
+	if err != nil {
+		log.Warnf("获取sso sign时出现错误: %v server: %v", err, signServer)
+		return nil, nil, nil, err
+	}
+	sign, _ = hex.DecodeString(gjson.GetBytes(response, "data.sign").String())
+	extra, _ = hex.DecodeString(gjson.GetBytes(response, "data.extra").String())
+	token, _ = hex.DecodeString(gjson.GetBytes(response, "data.token").String())
+	return sign, extra, token, nil
 }
